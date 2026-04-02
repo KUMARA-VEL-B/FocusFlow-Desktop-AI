@@ -1,0 +1,862 @@
+/* =========================================================
+   FocusFlow — app.js
+   Main Application Logic
+   ========================================================= */
+'use strict';
+
+// ─── Constants ─────────────────────────────────────────────
+const STORAGE_KEYS = {
+  TASKS:      'ff_tasks',
+  PENDING:    'ff_pending',
+  HISTORY:    'ff_history',
+  THEME:      'ff_theme',
+  LAST_DATE:  'ff_last_date',
+  WEATHER:    'ff_weather_cache'
+};
+
+const WEATHER_CACHE_TTL = 30 * 60 * 1000; // 30 min
+const DAY_NAMES  = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const MON_NAMES  = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+const WEATHER_API = 'https://wttr.in/?format=j1'; // Free, no API key needed
+
+// ─── State ──────────────────────────────────────────────────
+let state = {
+  tasks:   [],
+  pending: [],
+  history: [],
+  theme:   'dark',
+  editingId: null,
+  deferInstall: null,
+  qaFailed: false,
+  undoData: null,
+  undoTimeout: null,
+};
+
+// ─── Storage Helpers ────────────────────────────────────────
+const storage = {
+  get(key, fallback = null) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw === null) return fallback;
+      return JSON.parse(raw);
+    } catch {
+      return fallback;
+    }
+  },
+  set(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+  },
+  remove(key) {
+    try { localStorage.removeItem(key); } catch {}
+  }
+};
+
+// ─── Unique ID Generator ────────────────────────────────────
+const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,7)}`;
+
+// ─── Toast System ───────────────────────────────────────────
+const I_SUCCESS = '✅';
+const I_ERROR   = '❌';
+const I_WARNING = '⚠️';
+const I_INFO    = 'ℹ️';
+
+function showToast(msg, type = 'info', duration = 3000, actionLabel = null, actionCallback = null) {
+  try {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    toast.setAttribute('role', 'alert');
+    
+    const textSpan = document.createElement('span');
+    textSpan.textContent = msg;
+    toast.appendChild(textSpan);
+    
+    if (actionLabel && actionCallback) {
+      const btn = document.createElement('button');
+      btn.textContent = actionLabel;
+      btn.style.cssText = 'margin-left: 10px; background: rgba(0,0,0,0.2); border: 1px solid var(--border); padding: 2px 8px; border-radius: 4px; color: inherit; cursor: pointer;';
+      btn.onclick = (e) => { e.stopPropagation(); actionCallback(); removeToast(toast); };
+      toast.appendChild(btn);
+    }
+    
+    toast.addEventListener('click', (e) => { if (e.target.tagName !== 'BUTTON') removeToast(toast); });
+    container.appendChild(toast);
+    setTimeout(() => removeToast(toast), duration);
+  } catch (err) {
+    console.error('[Toast Error]', err);
+  }
+}
+function removeToast(el) {
+  if (!el || el.dataset.removing) return;
+  el.dataset.removing = '1';
+  el.classList.add('removing');
+  setTimeout(() => el.remove(), 350);
+}
+
+// ─── Date Utilities ──────────────────────────────────────────
+function todayString() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+function formatDateDisplay(d = new Date()) {
+  return `${DAY_NAMES[d.getDay()]}, ${d.getDate()} ${MON_NAMES[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+// ─── New-Day Check ───────────────────────────────────────────
+function handleDayRollover() {
+  try {
+    const today = todayString();
+    const lastDate = storage.get(STORAGE_KEYS.LAST_DATE, today);
+
+    if (lastDate !== today) {
+      // Move unfinished tasks to pending
+      const unfinished = state.tasks.filter(t => !t.completed);
+      if (unfinished.length > 0) {
+        const newPending = [
+          ...state.pending,
+          ...unfinished.map(t => ({ ...t, fromDate: lastDate }))
+        ];
+        state.pending = newPending;
+        storage.set(STORAGE_KEYS.PENDING, state.pending);
+        showToast(`${I_WARNING} ${unfinished.length} task(s) moved to Yesterday's Pending`, 'warning', 5000);
+      }
+      
+      // Preserve completed tasks in history
+      const finished = state.tasks.filter(t => t.completed);
+      if (finished.length > 0) {
+        state.history = [
+          ...finished.map(t => ({ ...t, fromDate: lastDate })),
+          ...state.history,
+        ].slice(0, 100); // keep last 100
+        storage.set(STORAGE_KEYS.HISTORY, state.history);
+      }
+
+      state.tasks = [];
+      storage.set(STORAGE_KEYS.TASKS, state.tasks);
+      storage.set(STORAGE_KEYS.LAST_DATE, today);
+    }
+
+    if (lastDate === today) {
+      storage.set(STORAGE_KEYS.LAST_DATE, today);
+    }
+  } catch (err) {
+    console.error('[Day Rollover Error]', err);
+  }
+}
+
+// ─── Weather ─────────────────────────────────────────────────
+const WEATHER_META = {
+  113: { icon: '☀️',  label: 'Sunny',       cls: 'weather-sunny' },
+  116: { icon: '⛅',  label: 'Partly cloudy', cls: 'weather-cloudy' },
+  119: { icon: '☁️',  label: 'Cloudy',       cls: 'weather-cloudy' },
+  122: { icon: '☁️',  label: 'Overcast',     cls: 'weather-cloudy' },
+  176: { icon: '🌦️',  label: 'Patchy rain',  cls: 'weather-rainy'  },
+  200: { icon: '⛈️',  label: 'Thundery',     cls: 'weather-stormy' },
+  227: { icon: '🌨️',  label: 'Blowing snow', cls: 'weather-snowy'  },
+  230: { icon: '❄️',  label: 'Blizzard',     cls: 'weather-snowy'  },
+  248: { icon: '🌫️',  label: 'Fog',          cls: 'weather-cloudy' },
+  260: { icon: '🌫️',  label: 'Freezing fog', cls: 'weather-cloudy' },
+  293: { icon: '🌧️',  label: 'Light rain',   cls: 'weather-rainy'  },
+  296: { icon: '🌧️',  label: 'Light rain',   cls: 'weather-rainy'  },
+  299: { icon: '🌧️',  label: 'Mod. rain',    cls: 'weather-rainy'  },
+  302: { icon: '🌧️',  label: 'Heavy rain',   cls: 'weather-rainy'  },
+  320: { icon: '🌨️',  label: 'Light sleet',  cls: 'weather-snowy'  },
+  323: { icon: '🌨️',  label: 'Light snow',   cls: 'weather-snowy'  },
+  335: { icon: '❄️',  label: 'Heavy snow',   cls: 'weather-snowy'  },
+  386: { icon: '⛈️',  label: 'Thunder rain', cls: 'weather-stormy' },
+  395: { icon: '⛈️',  label: 'Thunder snow', cls: 'weather-stormy' },
+};
+function getWeatherMeta(code) {
+  return WEATHER_META[code] || { icon: '🌤️', label: 'Clear', cls: 'weather-clear' };
+}
+
+async function fetchWeather() {
+  const card = document.getElementById('weather-card');
+  if (!card) return;
+  card.classList.add('loading');
+
+  // Check cache
+  try {
+    const cache = storage.get(STORAGE_KEYS.WEATHER);
+    if (cache && (Date.now() - cache.ts) < WEATHER_CACHE_TTL) {
+      renderWeather(cache.data);
+      card.classList.remove('loading');
+      return;
+    }
+  } catch {}
+
+  try {
+    let url = WEATHER_API;
+    
+    // Try to obtain precise geolocation
+    if ('geolocation' in navigator) {
+      try {
+        const pos = await new Promise((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 3000 });
+        });
+        url = `https://wttr.in/${pos.coords.latitude},${pos.coords.longitude}?format=j1`;
+      } catch (e) {
+        console.info('[Weather] Geolocation denied or timeout, falling back to IP based.');
+      }
+    }
+
+    const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+
+    const current  = json.current_condition?.[0];
+    const nearest  = json.nearest_area?.[0];
+    if (!current) throw new Error('No weather data');
+
+    const code  = parseInt(current.weatherCode);
+    const tempC = parseInt(current.temp_C);
+    const tempF = parseInt(current.temp_F);
+    const meta  = getWeatherMeta(code);
+    const desc  = current.weatherDesc?.[0]?.value || meta.label;
+    const city  = nearest?.areaName?.[0]?.value || '';
+    const ctry  = nearest?.country?.[0]?.value  || '';
+    const humidity = current.humidity || '';
+    const feelsC   = current.FeelsLikeC || tempC;
+
+    const data = { tempC, tempF, desc, city, ctry, humidity, feelsC, meta, code };
+    storage.set(STORAGE_KEYS.WEATHER, { data, ts: Date.now() });
+    renderWeather(data);
+  } catch (err) {
+    console.warn('[Weather] Fetch failed:', err.message);
+    card.innerHTML = `
+      <span class="weather-icon">🌐</span>
+      <div class="weather-info">
+        <div class="weather-desc">Weather unavailable</div>
+        <div class="weather-location">Check your connection</div>
+      </div>`;
+  } finally {
+    card.classList.remove('loading');
+  }
+}
+
+function renderWeather(data) {
+  const card = document.getElementById('weather-card');
+  if (!card) return;
+
+  // Apply weather theme class
+  document.body.classList.remove(
+    'weather-sunny','weather-cloudy','weather-rainy',
+    'weather-snowy','weather-stormy','weather-clear'
+  );
+  document.body.classList.add(data.meta.cls);
+
+  const loc = [data.city, data.ctry].filter(Boolean).join(', ');
+  card.innerHTML = `
+    <span class="weather-icon">${data.meta.icon}</span>
+    <div class="weather-info">
+      <div class="weather-temp">${data.tempC}°C <span style="font-size:0.85em;opacity:0.6;">${data.tempF}°F</span></div>
+      <div class="weather-desc">${data.desc}</div>
+      ${loc ? `<div class="weather-location">📍 ${loc}</div>` : ''}
+    </div>
+    <div class="weather-badge">💧 ${data.humidity}%</div>`;
+}
+
+// ─── Progress ────────────────────────────────────────────────
+function updateProgress() {
+  try {
+    const total     = state.tasks.length;
+    const done      = state.tasks.filter(t => t.completed).length;
+    const pct       = total === 0 ? 0 : Math.round((done / total) * 100);
+
+    const fill  = document.getElementById('progress-fill');
+    const pctEl = document.getElementById('progress-pct');
+    const lblEl = document.getElementById('progress-label');
+    const track = document.querySelector('.progress-track');
+
+    if (fill)  fill.style.width  = pct + '%';
+    if (pctEl) pctEl.textContent = pct + '%';
+    if (lblEl) lblEl.textContent = `${done} / ${total} tasks`;
+    if (track) track.setAttribute('aria-valuenow', pct);
+
+    // Update stats
+    const statTotal   = document.getElementById('stat-total');
+    const statDone    = document.getElementById('stat-done');
+    const statPending = document.getElementById('stat-pending');
+    if (statTotal)   statTotal.textContent   = total;
+    if (statDone)    statDone.textContent    = done;
+    if (statPending) statPending.textContent = state.pending.length;
+
+    // Update section badge counts
+    const badgeToday   = document.getElementById('badge-today');
+    const badgePending = document.getElementById('badge-pending');
+    if (badgeToday)   badgeToday.textContent   = state.tasks.length;
+    if (badgePending) badgePending.textContent = state.pending.length;
+  } catch (err) {
+    console.error('[Progress Update Error]', err);
+  }
+}
+
+// ─── Render Tasks ────────────────────────────────────────────
+let draggedId = null;
+
+function handleDragStart(e) { 
+  draggedId = this.dataset.id; 
+  this.classList.add('dragging'); 
+  e.dataTransfer.effectAllowed = 'move';
+}
+function handleDragOver(e) { 
+  e.preventDefault(); 
+  e.dataTransfer.dropEffect = 'move'; 
+}
+function handleDragEnd(e) {
+  this.classList.remove('dragging');
+}
+function handleDrop(e) {
+  e.preventDefault();
+  const targetItem = e.target.closest('.task-item');
+  if (!targetItem) return;
+  const targetId = targetItem.dataset.id;
+  if (!draggedId || !targetId || draggedId === targetId) return;
+  
+  const oldIdx = state.tasks.findIndex(t => t.id === draggedId);
+  const newIdx = state.tasks.findIndex(t => t.id === targetId);
+  if (oldIdx !== -1 && newIdx !== -1) {
+    const [task] = state.tasks.splice(oldIdx, 1);
+    state.tasks.splice(newIdx, 0, task);
+    storage.set(STORAGE_KEYS.TASKS, state.tasks);
+    renderTasks();
+  }
+}
+
+function renderTasks() {
+  try {
+    const list = document.getElementById('task-list');
+    if (!list) return;
+    list.innerHTML = '';
+
+    if (state.tasks.length === 0) {
+      list.innerHTML = `
+        <div class="empty-state animate-fade">
+          <div class="empty-icon">🎯</div>
+          <strong>No tasks yet</strong>
+          Add your first task above to get started!
+        </div>`;
+      updateProgress(); // always update stats even when empty
+      return;
+    }
+
+    state.tasks.forEach(task => {
+      const item = document.createElement('div');
+      item.className = `task-item${task.completed ? ' completed' : ''}`;
+      item.dataset.id = task.id;
+      item.draggable = true;
+
+      const prioIcon = task.priority === 'high' ? '🔴 ' : task.priority === 'medium' ? '🟡 ' : task.priority === 'low' ? '🟢 ' : '';
+
+      item.innerHTML = `
+        <div class="task-checkbox${task.completed ? ' checked' : ''}"
+             role="checkbox" aria-checked="${task.completed}"
+             aria-label="Toggle ${escHtml(task.text)}"
+             tabindex="0" id="chk-${task.id}"></div>
+        <span class="task-text" id="txt-${task.id}">${prioIcon}${escHtml(task.text)}</span>
+        <div class="task-actions">
+          <button class="icon-btn edit"   id="edit-btn-${task.id}"   aria-label="Edit task"   title="Edit">✏️</button>
+          <button class="icon-btn delete" id="delete-btn-${task.id}" aria-label="Delete task" title="Delete">🗑️</button>
+        </div>`;
+
+      // Drag events
+      item.addEventListener('dragstart', handleDragStart);
+      item.addEventListener('dragend', handleDragEnd);
+      item.addEventListener('dragover', handleDragOver);
+      item.addEventListener('drop', handleDrop);
+
+      // Toggle complete
+      const chk = item.querySelector('.task-checkbox');
+      chk.addEventListener('click',    () => toggleTask(task.id));
+      chk.addEventListener('keydown',  e => { if (e.key === 'Enter' || e.key === ' ') toggleTask(task.id); });
+
+      // Edit
+      item.querySelector('.edit').addEventListener('click', e => {
+        e.stopPropagation();
+        startEdit(task.id);
+      });
+
+      // Delete
+      item.querySelector('.delete').addEventListener('click', e => {
+        e.stopPropagation();
+        deleteTask(task.id, item);
+      });
+
+      list.appendChild(item);
+    });
+
+    updateProgress();
+  } catch (err) {
+    console.error('[Render Tasks Error]', err);
+  }
+}
+
+function renderPending() {
+  try {
+    const list    = document.getElementById('pending-list');
+    const section = document.getElementById('pending-section');
+    if (!list || !section) return;
+
+    section.style.display = state.pending.length === 0 ? 'none' : '';
+    list.innerHTML = '';
+
+    if (state.pending.length === 0) return;
+
+    state.pending.forEach(task => {
+      const item = document.createElement('div');
+      item.className = `task-item${task.completed ? ' completed' : ''}`;
+      item.dataset.id = task.id;
+      const fromLabel = task.fromDate ? ` · from ${task.fromDate}` : '';
+      item.innerHTML = `
+        <div class="task-checkbox${task.completed ? ' checked' : ''}"
+             role="checkbox" aria-checked="${task.completed}"
+             tabindex="0" id="pchk-${task.id}"></div>
+        <span class="task-text">${escHtml(task.text)} <small style="opacity:0.5;font-size:0.75em">${fromLabel}</small></span>
+        <div class="task-actions">
+          <button class="icon-btn" id="move-btn-${task.id}" title="Move to today" aria-label="Move to today">📋</button>
+          <button class="icon-btn delete" id="pdel-btn-${task.id}" title="Remove" aria-label="Remove pending task">🗑️</button>
+        </div>`;
+
+      item.querySelector('.task-checkbox').addEventListener('click', () => togglePending(task.id));
+      item.querySelector(`#move-btn-${task.id}`).addEventListener('click', e => {
+        e.stopPropagation();
+        movePendingToToday(task.id);
+      });
+      item.querySelector(`#pdel-btn-${task.id}`).addEventListener('click', e => {
+        e.stopPropagation();
+        deletePending(task.id, item);
+      });
+
+      list.appendChild(item);
+    });
+  } catch (err) {
+    console.error('[Render Pending Error]', err);
+  }
+}
+
+function renderHistory() {
+  try {
+    const list = document.getElementById('history-list');
+    const section = document.getElementById('history-section');
+    const badge = document.getElementById('badge-history');
+    if (!list || !section || !badge) return;
+
+    if (!state.history || state.history.length === 0) {
+      section.style.display = 'none';
+      return;
+    }
+
+    section.style.display = '';
+    badge.textContent = state.history.length;
+    list.innerHTML = '';
+
+    state.history.slice(0, 20).forEach(task => {
+      const item = document.createElement('div');
+      item.className = 'task-item completed';
+      const fromLabel = task.fromDate ? ` · from ${task.fromDate}` : '';
+      const prioIcon = (task.priority === 'high') ? '🔴 ' : (task.priority === 'medium') ? '🟡 ' : (task.priority === 'low') ? '🟢 ' : '';
+      
+      item.innerHTML = `
+        <div class="task-checkbox checked" role="checkbox" aria-checked="true" tabindex="0"></div>
+        <span class="task-text">${prioIcon}${escHtml(task.text)} <small style="opacity:0.5;font-size:0.75em">${fromLabel}</small></span>
+      `;
+      list.appendChild(item);
+    });
+  } catch (err) {
+    console.error('[Render History Error]', err);
+  }
+}
+
+// ─── Task Actions ────────────────────────────────────────────
+function addTask() {
+  try {
+    const input = document.getElementById('task-input');
+    const prioSel = document.getElementById('task-priority');
+    if (!input) return;
+    const text = input.value.trim();
+    const priority = prioSel ? prioSel.value : 'none';
+
+    if (!text) {
+      showToast(`${I_WARNING} Please enter a task`, 'warning');
+      input.focus();
+      return;
+    }
+    if (state.tasks.some(t => t.text.toLowerCase() === text.toLowerCase())) {
+      showToast(`${I_WARNING} Task already exists`, 'warning');
+      input.select();
+      return;
+    }
+    if (text.length > 200) {
+      showToast(`${I_WARNING} Task too long (max 200 chars)`, 'warning');
+      return;
+    }
+
+    const task = { id: uid(), text, priority, completed: false, createdAt: Date.now() };
+    state.tasks.unshift(task); // newest first
+    storage.set(STORAGE_KEYS.TASKS, state.tasks);
+    input.value = '';
+    renderTasks();
+    showToast(`${I_SUCCESS} Task added!`, 'success');
+  } catch (err) {
+    console.error('[Add Task Error]', err);
+    showToast(`${I_ERROR} Could not add task`, 'error');
+  }
+}
+
+function toggleTask(id) {
+  try {
+    const task = state.tasks.find(t => t.id === id);
+    if (!task) return;
+    task.completed = !task.completed;
+    storage.set(STORAGE_KEYS.TASKS, state.tasks);
+    renderTasks();
+    if (task.completed) {
+      const allDone = state.tasks.every(t => t.completed);
+      showToast(allDone ? '🎉 All tasks complete! Great job!' : `${I_SUCCESS} Task completed!`, 'success');
+    }
+  } catch (err) {
+    console.error('[Toggle Task Error]', err);
+  }
+}
+
+function deleteTask(id, el) {
+  try {
+    el.classList.add('removing');
+    // Clear previous undo timeout
+    if (state.undoTimeout) clearTimeout(state.undoTimeout);
+    
+    setTimeout(() => {
+      const idx = state.tasks.findIndex(t => t.id === id);
+      if (idx === -1) return;
+      const task = state.tasks[idx];
+      state.undoData = { task, index: idx, type: 'today' };
+
+      state.tasks.splice(idx, 1);
+      storage.set(STORAGE_KEYS.TASKS, state.tasks);
+      renderTasks();
+      
+      showToast('🗑️ Task removed.', 'info', 5000, 'Undo', () => {
+        if (!state.undoData || state.undoData.type !== 'today') return;
+        state.tasks.splice(state.undoData.index, 0, state.undoData.task);
+        storage.set(STORAGE_KEYS.TASKS, state.tasks);
+        state.undoData = null;
+        renderTasks();
+        showToast(`${I_SUCCESS} Task restored!`, 'success');
+      });
+      
+      state.undoTimeout = setTimeout(() => { state.undoData = null; }, 5500);
+    }, 300);
+  } catch (err) {
+    console.error('[Delete Task Error]', err);
+  }
+}
+
+function startEdit(id) {
+  try {
+    const task = state.tasks.find(t => t.id === id);
+    if (!task) return;
+    state.editingId = id;
+
+    const editInput  = document.getElementById('edit-input');
+    const editRow    = document.getElementById('edit-row');
+    if (!editInput || !editRow) return;
+
+    editInput.value = task.text;
+    editRow.classList.add('visible');
+    editInput.focus();
+    editInput.select();
+  } catch (err) {
+    console.error('[Start Edit Error]', err);
+  }
+}
+
+function saveEdit() {
+  try {
+    const editInput = document.getElementById('edit-input');
+    if (!editInput) return;
+    const newText = editInput.value.trim();
+
+    if (!newText) {
+      showToast(`${I_WARNING} Task cannot be empty`, 'warning');
+      editInput.focus();
+      return;
+    }
+    if (state.tasks.some(t => t.id !== state.editingId && t.text.toLowerCase() === newText.toLowerCase())) {
+      showToast(`${I_WARNING} A task with this name already exists`, 'warning');
+      return;
+    }
+
+    const task = state.tasks.find(t => t.id === state.editingId);
+    if (task) {
+      task.text = newText;
+      storage.set(STORAGE_KEYS.TASKS, state.tasks);
+      renderTasks();
+      showToast(`${I_SUCCESS} Task updated!`, 'success');
+    }
+    cancelEdit();
+  } catch (err) {
+    console.error('[Save Edit Error]', err);
+  }
+}
+
+function cancelEdit() {
+  try {
+    state.editingId = null;
+    const editRow = document.getElementById('edit-row');
+    if (editRow) editRow.classList.remove('visible');
+    const editInput = document.getElementById('edit-input');
+    if (editInput) editInput.value = '';
+  } catch (err) {
+    console.error('[Cancel Edit Error]', err);
+  }
+}
+
+// ─── Pending Actions ─────────────────────────────────────────
+function togglePending(id) {
+  try {
+    const task = state.pending.find(t => t.id === id);
+    if (!task) return;
+    task.completed = !task.completed;
+    storage.set(STORAGE_KEYS.PENDING, state.pending);
+    renderPending();
+    updateProgress();
+  } catch (err) {
+    console.error('[Toggle Pending Error]', err);
+  }
+}
+
+function movePendingToToday(id) {
+  try {
+    const idx = state.pending.findIndex(t => t.id === id);
+    if (idx === -1) return;
+    const [task] = state.pending.splice(idx, 1);
+    if (state.tasks.some(t => t.text.toLowerCase() === task.text.toLowerCase())) {
+      showToast(`${I_WARNING} Already in today's list`, 'warning');
+      state.pending.splice(idx, 0, task);
+      return;
+    }
+    const newTask = { id: uid(), text: task.text, completed: false, createdAt: Date.now() };
+    state.tasks.unshift(newTask);
+    storage.set(STORAGE_KEYS.TASKS, state.tasks);
+    storage.set(STORAGE_KEYS.PENDING, state.pending);
+    renderTasks();
+    renderPending();
+    showToast(`${I_SUCCESS} Moved to today's list!`, 'success');
+  } catch (err) {
+    console.error('[Move Pending Error]', err);
+  }
+}
+
+function deletePending(id, el) {
+  try {
+    el.classList.add('removing');
+    setTimeout(() => {
+      state.pending = state.pending.filter(t => t.id !== id);
+      storage.set(STORAGE_KEYS.PENDING, state.pending);
+      renderPending();
+      updateProgress();
+      showToast('🗑️ Removed from pending', 'info', 2000);
+    }, 300);
+  } catch (err) {
+    console.error('[Delete Pending Error]', err);
+  }
+}
+
+// ─── Theme ───────────────────────────────────────────────────
+function toggleTheme() {
+  try {
+    state.theme = state.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', state.theme);
+    storage.set(STORAGE_KEYS.THEME, state.theme);
+    const btn = document.getElementById('theme-btn');
+    if (btn) btn.title = state.theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode';
+    btn.textContent = state.theme === 'dark' ? '☀️' : '🌙';
+  } catch (err) {
+    console.error('[Theme Toggle Error]', err);
+  }
+}
+
+// ─── Date Display ────────────────────────────────────────────
+function updateDateDisplay() {
+  try {
+    const el = document.getElementById('date-display');
+    if (el) el.textContent = formatDateDisplay();
+    const dayEl = document.getElementById('day-display');
+    const d = new Date();
+    if (dayEl) dayEl.textContent = `${DAY_NAMES[d.getDay()]} · ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+  } catch (err) {
+    console.error('[Date Display Error]', err);
+  }
+}
+
+// ─── QA System ───────────────────────────────────────────────
+async function runQAChecks() {
+  const buttons = document.querySelectorAll('button, [role="button"]');
+  const errors  = [];
+
+  for (const btn of buttons) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (typeof btn.click !== 'function') throw new Error(`Button ${btn.id || btn.textContent?.slice(0,20)} has no click method`);
+        if (!btn.id && !btn.getAttribute('aria-label') && !btn.title) {
+          // Warn only, not an error
+        }
+      } catch (err) {
+        errors.push({ btn: btn.id || btn.textContent?.slice(0,20) || 'unknown', err: err.message, attempt });
+      }
+    }
+  }
+
+  // Check localStorage
+  try {
+    localStorage.setItem('__qa_test__', '1');
+    const v = localStorage.getItem('__qa_test__');
+    if (v !== '1') throw new Error('localStorage read/write mismatch');
+    localStorage.removeItem('__qa_test__');
+  } catch (err) {
+    errors.push({ btn: 'localStorage', err: err.message, attempt: 0 });
+  }
+
+  if (errors.length > 0) {
+    console.warn('[QA Errors]', errors);
+    state.qaFailed = true;
+    const warn = document.getElementById('qa-warning');
+    if (warn) warn.classList.add('visible');
+  } else {
+    console.info('[QA] All checks passed ✅');
+  }
+}
+
+// ─── PWA: Install Prompt ──────────────────────────────────────
+function setupPWA() {
+  try {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js')
+        .then(reg => console.info('[SW] Registered, scope:', reg.scope))
+        .catch(err => console.warn('[SW] Registration failed:', err));
+    }
+
+    window.addEventListener('beforeinstallprompt', e => {
+      e.preventDefault();
+      state.deferInstall = e;
+      const btn = document.getElementById('install-btn');
+      if (btn) btn.classList.add('visible');
+    });
+
+    window.addEventListener('appinstalled', () => {
+      const btn = document.getElementById('install-btn');
+      if (btn) btn.classList.remove('visible');
+      state.deferInstall = null;
+      showToast('🎉 FocusFlow Desktop AI installed successfully!', 'success', 4000);
+    });
+  } catch (err) {
+    console.error('[PWA Setup Error]', err);
+  }
+}
+
+function installApp() {
+  if (!state.deferInstall) return;
+  state.deferInstall.prompt();
+  state.deferInstall.userChoice.then(choice => {
+    if (choice.outcome === 'accepted') {
+      showToast('🎉 Installing FocusFlow Desktop AI…', 'success');
+    } else {
+      showToast(`${I_INFO} Installation cancelled`, 'info');
+    }
+    state.deferInstall = null;
+  }).catch(err => {
+    console.error('[Install Error]', err);
+    showToast(`${I_ERROR} Installation failed`, 'error');
+  });
+}
+
+// ─── HTML Escape ──────────────────────────────────────────────
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#039;');
+}
+
+// ─── Init ─────────────────────────────────────────────────────
+function init() {
+  try {
+    // Load state
+    state.tasks   = storage.get(STORAGE_KEYS.TASKS,   []);
+    state.pending = storage.get(STORAGE_KEYS.PENDING,  []);
+    state.history = storage.get(STORAGE_KEYS.HISTORY, []);
+    state.theme   = storage.get(STORAGE_KEYS.THEME,   'dark');
+
+    // Validate arrays
+    if (!Array.isArray(state.tasks))   state.tasks   = [];
+    if (!Array.isArray(state.pending)) state.pending = [];
+    if (!Array.isArray(state.history)) state.history = [];
+
+    // Apply theme
+    document.documentElement.setAttribute('data-theme', state.theme);
+    const themeBtn = document.getElementById('theme-btn');
+    if (themeBtn) themeBtn.textContent = state.theme === 'dark' ? '☀️' : '🌙';
+
+    // Day rollover
+    handleDayRollover();
+
+    // Date display
+    updateDateDisplay();
+    setInterval(updateDateDisplay, 60000); // refresh every minute
+
+    // Render
+    renderTasks();
+    renderPending();
+    renderHistory();
+    
+    // Weather
+    fetchWeather();
+
+    // PWA
+    setupPWA();
+
+    // Event listeners
+    const taskInput = document.getElementById('task-input');
+    taskInput?.addEventListener('keydown', e => { if (e.key === 'Enter') addTask(); });
+
+    document.getElementById('add-btn')?.addEventListener('click', addTask);
+    document.getElementById('theme-btn')?.addEventListener('click', toggleTheme);
+    document.getElementById('install-btn')?.addEventListener('click', installApp);
+    
+    document.getElementById('clear-history-btn')?.addEventListener('click', () => {
+      state.history = [];
+      storage.set(STORAGE_KEYS.HISTORY, state.history);
+      renderHistory();
+      showToast(`${I_SUCCESS} History cleared`, 'success');
+    });
+    document.getElementById('save-btn')?.addEventListener('click', saveEdit);
+    document.getElementById('cancel-btn')?.addEventListener('click', cancelEdit);
+    document.getElementById('edit-input')?.addEventListener('keydown', e => {
+      if (e.key === 'Enter')  saveEdit();
+      if (e.key === 'Escape') cancelEdit();
+    });
+    document.getElementById('refresh-weather')?.addEventListener('click', () => {
+      storage.remove(STORAGE_KEYS.WEATHER);
+      fetchWeather();
+      showToast(`${I_INFO} Refreshing weather…`, 'info', 2000);
+    });
+
+    // QA (run after a short delay so UI is fully interactive)
+    setTimeout(runQAChecks, 800);
+
+    console.info('[FocusFlow Desktop AI] Initialized ✅');
+  } catch (err) {
+    console.error('[Init Error]', err);
+    showToast(`${I_ERROR} App failed to initialise. Refreshing may help.`, 'error', 6000);
+  }
+}
+
+// Start when DOM ready
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}

@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#6c63ff" />
+  <meta name="description" content="FocusFlow Desktop AI — A clean, minimal daily task manager powered by AI insights. Stay focused, track progress, and complete your goals every day." />
+  <meta name="keywords" content="productivity, task manager, todo, daily planner, focus, goals" />
+  <meta name="author" content="FocusFlow Desktop AI" />
+
+  <!-- Open Graph -->
+  <meta property="og:title"       content="FocusFlow Desktop AI – Daily Task Manager" />
+  <meta property="og:description" content="Stay focused and complete your daily goals with FocusFlow Desktop AI." />
+  <meta property="og:type"        content="website" />
+
+  <!-- Favicon & Icons -->
+  <link rel="icon" type="image/png" href="./icon.png" />
+  <link rel="apple-touch-icon" href="./icons/icon-192.png" />
+
+  <!-- PWA -->
+  <link rel="manifest" href="./manifest.json" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="FocusFlow Desktop AI" />
+
+  <title>FocusFlow Desktop AI – Daily Task Manager</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+
+<!-- Ambient Background -->
+<div class="bg-mesh" aria-hidden="true"></div>
+
+<!-- Toast Container -->
+<div id="toast-container" aria-live="polite" aria-atomic="false"></div>
+
+<!-- App Shell -->
+<div id="app" role="main">
+
+  <!-- QA Warning Banner -->
+  <div id="qa-warning" role="alert" aria-live="assertive">
+    <span>⚠️</span>
+    <span>Some features may not work correctly. Please refresh the page.</span>
+  </div>
+
+  <!-- ─── Header ────────────────────────────────────────────── -->
+  <header>
+    <div class="header-left">
+      <div class="logo-icon" aria-hidden="true">
+        <img src="./icon.png" alt="FocusFlow logo" width="32" height="32" class="logo-img" />
+      </div>
+      <div class="header-text">
+        <h1>FocusFlow Desktop AI</h1>
+        <p class="tagline">Stay focused · Get things done</p>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button id="install-btn" aria-label="Install app">
+        📲 <span>Install App</span>
+      </button>
+      <button id="theme-btn" class="icon-btn" title="Toggle Theme" aria-label="Toggle light/dark theme">☀️</button>
+    </div>
+  </header>
+
+  <!-- ─── Weather Card ──────────────────────────────────────── -->
+  <div id="weather-card" role="region" aria-label="Current weather">
+    <span class="weather-icon skeleton" style="width:2.2rem;height:2.2rem;border-radius:8px;display:inline-block;">‎</span>
+    <div class="weather-info">
+      <div class="weather-temp skeleton" style="width:80px;height:1.25rem;margin-bottom:4px;">‎</div>
+      <div class="weather-desc skeleton" style="width:120px;height:0.8rem;">‎</div>
+    </div>
+    <button id="refresh-weather" class="icon-btn" title="Refresh weather" aria-label="Refresh weather" style="margin-left:auto;">🔄</button>
+  </div>
+
+  <!-- ─── Date & Progress ────────────────────────────────────── -->
+  <div class="date-progress-section">
+    <div class="date-block">
+      <div class="date-main" id="date-display" aria-live="polite">Loading…</div>
+      <div class="date-sub"  id="day-display"></div>
+    </div>
+    <div class="progress-block" role="region" aria-label="Task progress">
+      <div class="progress-label">
+        <span id="progress-label">0 / 0 tasks</span>
+        <strong id="progress-pct">0%</strong>
+      </div>
+      <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Completion progress">
+        <div id="progress-fill" class="progress-fill" style="width:0%"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Stats Bar ──────────────────────────────────────────── -->
+  <div class="stats-bar" role="region" aria-label="Task statistics">
+    <div class="stat-card">
+      <div class="stat-value" id="stat-total">0</div>
+      <div class="stat-label">Total Tasks</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" id="stat-done" style="color:var(--success)">0</div>
+      <div class="stat-label">Completed</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" id="stat-pending" style="color:var(--warning)">0</div>
+      <div class="stat-label">From Yesterday</div>
+    </div>
+  </div>
+
+  <!-- ─── Add Task Card ──────────────────────────────────────── -->
+  <div class="add-task-card" role="region" aria-label="Add new task">
+    <div class="input-row">
+      <select id="task-priority" class="priority-select" aria-label="Task priority">
+        <option value="none" title="No Priority">⚪</option>
+        <option value="low" title="Low Priority">🟢</option>
+        <option value="medium" title="Medium Priority">🟡</option>
+        <option value="high" title="High Priority">🔴</option>
+      </select>
+      <input
+        type="text"
+        id="task-input"
+        placeholder="✍️  What do you need to do today?"
+        maxlength="200"
+        autocomplete="off"
+        autocorrect="off"
+        spellcheck="true"
+        aria-label="New task"
+      />
+      <button class="btn-add" id="add-btn" aria-label="Add task">
+        <span aria-hidden="true">＋</span> Add Task
+      </button>
+    </div>
+
+    <!-- Edit row (shown when editing a task) -->
+    <div class="edit-row" id="edit-row">
+      <input
+        type="text"
+        id="edit-input"
+        placeholder="Edit your task…"
+        maxlength="200"
+        autocomplete="off"
+        aria-label="Edit task text"
+      />
+      <button class="btn-save"   id="save-btn"   aria-label="Save edited task">💾 Save</button>
+      <button class="btn-cancel" id="cancel-btn" aria-label="Cancel editing">✕</button>
+    </div>
+  </div>
+
+  <!-- ─── Today's Tasks ──────────────────────────────────────── -->
+  <section id="tasks-section" aria-label="Today's tasks">
+    <div class="section-header">
+      <h2>📋 Today's Tasks</h2>
+      <span class="section-badge" id="badge-today">0</span>
+      <div class="line" aria-hidden="true"></div>
+    </div>
+    <div class="task-list" id="task-list" role="list" aria-label="Today's task list">
+      <div class="empty-state animate-fade">
+        <div class="empty-icon">🎯</div>
+        <strong>No tasks yet</strong>
+        Add your first task above to get started!
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── Pending from Yesterday ─────────────────────────────── -->
+  <section id="pending-section" aria-label="Pending tasks from yesterday" style="display:none;">
+    <div class="section-header">
+      <h2>⏳ Pending from Yesterday</h2>
+      <span class="section-badge" id="badge-pending">0</span>
+      <div class="line" aria-hidden="true"></div>
+    </div>
+    <div class="task-list" id="pending-list" role="list" aria-label="Pending task list">
+    </div>
+  </section>
+
+  <!-- ─── History (Completed Past Tasks) ─────────────────────── -->
+  <section id="history-section" aria-label="Completed past tasks">
+    <div class="section-header">
+      <h2>📁 History</h2>
+      <span class="section-badge" id="badge-history">0</span>
+      <div class="line" aria-hidden="true"></div>
+      <button class="icon-btn clear-history-btn" id="clear-history-btn" title="Clear History">🗑️</button>
+    </div>
+    <div class="task-list" id="history-list" role="list" aria-label="History task list">
+    </div>
+  </section>
+
+</div><!-- /#app -->
+
+<script src="./app.js"></script>
+</body>
+</html>
